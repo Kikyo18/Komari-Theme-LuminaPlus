@@ -272,6 +272,17 @@
   animation: chart-reveal 420ms ease-out;
 }
 
+/* 折线入场：从左到右扫出，模拟逐渐画出（canvas 没法逐条 path 动画，用整体揭示近似）。
+   仅流量页使用——实例页的负载/Ping 图例开关会重建 .uplot 节点，挂入场动画会跟着重播。 */
+@keyframes chart-reveal {
+  from {
+    clip-path: inset(0 100% 0 0);
+  }
+  to {
+    clip-path: inset(0 0 0 0);
+  }
+}
+
 .traffic-rate-chart-canvas .u-title,
 .traffic-rate-chart-canvas .u-legend {
   display: none;

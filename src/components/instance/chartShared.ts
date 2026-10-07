@@ -58,6 +58,68 @@ export function getAxisColors(isDark: boolean): { grid: string; text: string } {
   };
 }
 
+// 受控 Y 轴。裸 auto 轴对准静态指标(磁盘、连接数等)会把不足 1% 的波动放大成整幅图的
+// 高度,刻度文字也会因精度不足互相重合;PingChart 的 yRange 是同思路的先例:
+// 容量类指标给 0 基准/固定量程,抖动类指标给一个最小量程下限。
+export interface YAxisRangeConfig {
+  /** 固定量程(如百分比模式的 [0,100]);给出时忽略其余选项。 */
+  fixed?: [number, number];
+  /** 下界钳到 0(容量/计数/速率类指标),且下界不再额外留 padding。 */
+  anchorZero?: boolean;
+  /** 最小量程;数据跨度不足时扩张到该值(anchorZero 时向 0 基准方向抬上限)。 */
+  minSpan?: number;
+}
+
+export type YScaleOptions =
+  | { auto: false; range: [number, number] }
+  | {
+      auto: true;
+      range: (u: uPlot, initMin: number, initMax: number) => [number, number];
+    };
+
+const Y_AXIS_PAD_RATIO = 0.12;
+
+export function buildYScale(config: YAxisRangeConfig): YScaleOptions {
+  if (config.fixed) {
+    // 静态数组 + auto:false 是 uPlot 文档对百分比轴这类固定量程的推荐写法。
+    return { auto: false, range: [config.fixed[0], config.fixed[1]] };
+  }
+  const anchorZero = config.anchorZero ?? false;
+  const minSpan = config.minSpan ?? 0;
+  return {
+    auto: true,
+    // 实时模式下 setData(reset) 会重新触发量程计算,fn 形式保证新极值能实时扩轴,
+    // 且 options 本身保持稳定,不会引发图表重建。
+    range: (_u, initMin, initMax) => {
+      let min = Number.isFinite(initMin) ? initMin : 0;
+      let max = Number.isFinite(initMax) ? initMax : 0;
+      if (max < min) [min, max] = [max, min];
+      if (anchorZero && min > 0) min = 0;
+      const span = max - min;
+      if (span < minSpan) {
+        if (anchorZero) {
+          max = min + minSpan;
+        } else {
+          const mid = (min + max) / 2;
+          min = mid - minSpan / 2;
+          max = mid + minSpan / 2;
+        }
+      }
+      const pad = (max - min) * Y_AXIS_PAD_RATIO;
+      return [anchorZero ? Math.min(0, min) : min - pad, max + pad];
+    },
+  };
+}
+
+/** 按量程跨度选择刻度小数位:极小量程下固定两位小数会让所有刻度文字重合(如整条轴都是 "71.53%")。 */
+export function pickAxisDecimals(span: number): number {
+  const safe = Number.isFinite(span) ? Math.abs(span) : 0;
+  if (safe >= 5) return 0;
+  if (safe >= 0.5) return 1;
+  if (safe >= 0.05) return 2;
+  return 3;
+}
+
 // uPlot 图表 (LoadChart / PingChart) 共享的悬停 tooltip 状态结构。
 export interface ChartTooltipState {
   show: boolean;

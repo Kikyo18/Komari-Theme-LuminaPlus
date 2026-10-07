@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import UplotReact from "uplot-react";
 import type uPlot from "uplot";
 import { Eye, EyeOff, RefreshCw } from "lucide-react";
@@ -29,8 +29,9 @@ import {
   resolvePingChartInterval,
   resolvePingSampleCounts,
 } from "@/utils/pingMetrics";
+import { REDUCED_MOTION_QUERY } from "@/utils/mediaQuery";
 import { usePreferences } from "@/hooks/usePreferences";
-import type { PingRecord, PingTaskStats } from "@/types/komari";
+import type { PingRecord, PingTask, PingTaskStats } from "@/types/komari";
 
 interface WeightedLatency {
   value: number;
@@ -104,6 +105,43 @@ const MAX_RENDER_POINTS = 160;
 const SMOOTH_WINDOW_POINTS = 1;
 const SMOOTH_WINDOW_POINTS_PEAK = 13;
 
+// Y 轴量程只由"当前可见线路"决定。做成纯函数:range 回调和图例切换后的
+// 重缩放动画共用同一份目标值,保证两条路径算出的坐标完全一致。
+function computePingYRange(
+  chart: uPlot.AlignedData,
+  tasks: PingTask[],
+  hiddenTaskIds: ReadonlySet<number>,
+  metric: "latency" | "loss",
+): [number, number] {
+  let min = Number.POSITIVE_INFINITY;
+  let max = Number.NEGATIVE_INFINITY;
+  for (let index = 0; index < tasks.length; index += 1) {
+    if (hiddenTaskIds.has(tasks[index].id)) continue;
+    const series = chart[index + 1] as Array<number | null | undefined> | undefined;
+    if (!series) continue;
+    for (const value of series) {
+      if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
+        if (value < min) min = value;
+        if (value > max) max = value;
+      }
+    }
+  }
+  if (metric === "loss") {
+    if (max === Number.NEGATIVE_INFINITY || max <= 5) return [0, 5];
+    if (max <= 10) return [0, 10];
+    if (max <= 25) return [0, 25];
+    if (max <= 50) return [0, 50];
+    return [0, 100];
+  }
+  if (min === Number.POSITIVE_INFINITY) return [0, 100];
+  if (min === max) {
+    const pad = Math.max(5, min * 0.1);
+    return [Math.max(0, min - pad), max + pad];
+  }
+  const pad = Math.max(5, (max - min) * 0.12);
+  return [Math.max(0, min - pad), max + pad];
+}
+
 export function PingChart({
   uuid,
   hours,
@@ -125,6 +163,13 @@ export function PingChart({
   const { resolvedAppearance } = usePreferences();
   const { w, h, ref: chartSizeRef } = useResponsiveChartSize("wide");
   const [hiddenTasks, setHiddenTasks] = useState<Set<number>>(new Set());
+  // 图例切换走 setSeries 局部更新,options 不再依赖 hiddenTasks(否则 uplot-react 会整图
+  // 销毁重建)。ref 供 options 构建(系列初始可见性、tooltip 行)、切换处理和重缩放动画
+  // 同步读取;渲染期写回,保证实例重建时读到最新可见集合。
+  const hiddenTasksRef = useRef<ReadonlySet<number>>(new Set());
+  const chartInstanceRef = useRef<uPlot | null>(null);
+  const yScaleAnimRef = useRef<number | null>(null);
+  hiddenTasksRef.current = hiddenTasks;
   const [chartMetric, setChartMetric] = useState<"latency" | "loss">("latency");
   const [connectNulls, setConnectNulls] = useState(false);
   const [cutPeak, setCutPeak] = useState(false);
@@ -166,10 +211,6 @@ export function PingChart({
   const visibleTasks = useMemo(
     () => tasks.filter((task) => !hiddenTasks.has(task.id)),
     [hiddenTasks, tasks],
-  );
-  const visibleTaskIds = useMemo(
-    () => new Set(visibleTasks.map((task) => task.id)),
-    [visibleTasks],
   );
 
   useEffect(() => {
@@ -301,36 +342,41 @@ export function PingChart({
     return historyCoverageLabel(coverageMeta, times[0], times[times.length - 1]);
   }, [chart, coverageMeta]);
 
-  const yRange = useMemo<[number | null, number | null]>(() => {
-    if (!chart) return [null, null];
-    let min = Number.POSITIVE_INFINITY;
-    let max = Number.NEGATIVE_INFINITY;
-    for (let index = 0; index < tasks.length; index += 1) {
-      if (!visibleTaskIds.has(tasks[index].id)) continue;
-      const series = chart[index + 1] as Array<number | null | undefined> | undefined;
-      if (!series) continue;
-      for (const value of series) {
-        if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
-          if (value < min) min = value;
-          if (value > max) max = value;
-        }
+  // 图例切换后的 Y 轴重缩放动画:setSeries 会触发 uPlot 内部按 range 函数同步重算量程
+  // (瞬间跳变),这里在 setSeries 之前捕获旧量程,之后逐帧 setScale 覆盖,让曲线从
+  // 旧位置平滑升降到新位置。prefers-reduced-motion 下不动画,直接采用内部重算结果。
+  const animateYScale = useCallback(
+    (u: uPlot, fromMin: number | undefined, fromMax: number | undefined, target: [number, number]) => {
+      const startMin = typeof fromMin === "number" && Number.isFinite(fromMin) ? fromMin : null;
+      const startMax = typeof fromMax === "number" && Number.isFinite(fromMax) ? fromMax : null;
+      const reducedMotion =
+        typeof window !== "undefined" && window.matchMedia(REDUCED_MOTION_QUERY).matches;
+      if (
+        startMin == null ||
+        startMax == null ||
+        (startMin === target[0] && startMax === target[1]) ||
+        reducedMotion
+      ) {
+        return;
       }
-    }
-    if (chartMetric === "loss") {
-      if (max === Number.NEGATIVE_INFINITY || max <= 5) return [0, 5];
-      if (max <= 10) return [0, 10];
-      if (max <= 25) return [0, 25];
-      if (max <= 50) return [0, 50];
-      return [0, 100];
-    }
-    if (min === Number.POSITIVE_INFINITY) return [0, 100];
-    if (min === max) {
-      const pad = Math.max(5, min * 0.1);
-      return [Math.max(0, min - pad), max + pad];
-    }
-    const pad = Math.max(5, (max - min) * 0.12);
-    return [Math.max(0, min - pad), max + pad];
-  }, [chart, chartMetric, tasks, visibleTaskIds]);
+      if (yScaleAnimRef.current != null) cancelAnimationFrame(yScaleAnimRef.current);
+      const start = performance.now();
+      const duration = 240;
+      const easeOutCubic = (t: number) => 1 - Math.pow(1 - t, 3);
+      const step = (now: number) => {
+        const t = Math.min(1, (now - start) / duration);
+        const k = easeOutCubic(t);
+        u.setScale("y", {
+          min: startMin + (target[0] - startMin) * k,
+          max: startMax + (target[1] - startMax) * k,
+        });
+        yScaleAnimRef.current = t < 1 ? requestAnimationFrame(step) : null;
+      };
+      yScaleAnimRef.current = requestAnimationFrame(step);
+    },
+    [],
+  );
+
 
   const baseOptions = useMemo<Omit<uPlot.Options, "width" | "height"> | null>(() => {
     if (!chart) return null;
@@ -341,7 +387,8 @@ export function PingChart({
       estimatedWidth: 196,
       setTooltip,
       buildRows: (idx) =>
-        visibleTasks
+        tasks
+          .filter((task) => !hiddenTasksRef.current.has(task.id))
           .map((task) => {
             const taskIndex = taskIndexById.get(task.id) ?? 0;
             const raw = chartRef.current[taskIndex + 1]?.[idx] as number | null | undefined;
@@ -375,7 +422,13 @@ export function PingChart({
         x: requestedXRange
           ? { time: true, auto: false, range: () => requestedXRange }
           : { time: true },
-        y: { auto: false, range: yRange },
+        // range 用函数形式读 hiddenTasksRef:切换图例后 setSeries/重缩放动画直接生效,
+        // options 本身保持稳定,uplot-react 不会销毁重建图表。
+        y: {
+          auto: true,
+          range: (_u, _dataMin, _dataMax) =>
+            computePingYRange(chart, tasks, hiddenTasksRef.current, chartMetric),
+        },
       },
       axes: [
         {
@@ -407,7 +460,7 @@ export function PingChart({
           stroke: taskColors.get(task.id) ?? colorForSeries(index, tasks.length),
           width: 1.7,
           spanGaps: connectNulls,
-          show: !hiddenTasks.has(task.id),
+          show: !hiddenTasksRef.current.has(task.id),
           points: { show: false },
         })),
       ],
@@ -426,7 +479,7 @@ export function PingChart({
         setCursor: [tooltipHooks.onSetCursor],
       },
     };
-  }, [chart, chartMetric, connectNulls, hiddenTasks, hours, isDark, requestedXRange, taskColors, taskIndexById, taskLabels, tasks, visibleTasks, yRange]);
+  }, [chart, chartMetric, connectNulls, hours, isDark, requestedXRange, taskColors, taskIndexById, taskLabels, tasks]);
 
   const options = useMemo<uPlot.Options | null>(
     () => (baseOptions ? { ...baseOptions, width: w, height: h } : null),
@@ -494,16 +547,45 @@ export function PingChart({
   };
 
   const toggleTask = (taskId: number) => {
-    setHiddenTasks((prev) => {
-      const next = new Set(prev);
-      if (next.has(taskId)) next.delete(taskId);
-      else next.add(taskId);
-      return next;
-    });
+    const next = new Set(hiddenTasksRef.current);
+    const willHide = !next.has(taskId);
+    if (willHide) next.add(taskId);
+    else next.delete(taskId);
+    hiddenTasksRef.current = next;
+    setHiddenTasks(next);
+    // 命令式微调现存实例:不销毁重建图表。先捕获当前量程作为动画起点(setSeries 会
+    // 同步触发内部重算),切换后再逐帧缓动到目标量程,曲线随之平滑升降。
+    const u = chartInstanceRef.current;
+    if (!u || !chart) return;
+    const seriesIdx = taskIndexById.get(taskId);
+    if (seriesIdx == null) return;
+    const fromMin = u.scales.y.min;
+    const fromMax = u.scales.y.max;
+    const target = computePingYRange(chart, tasks, hiddenTasksRef.current, chartMetric);
+    u.setSeries(seriesIdx + 1, { show: !willHide });
+    // 仅当所有线路都被隐藏(图表即将切到空态)时跳过动画;恢复最后一条隐藏线路
+    // 时量程变化最大,恰恰最需要缓动。
+    if (next.size < tasks.length) animateYScale(u, fromMin, fromMax, target);
   };
 
   const toggleAll = () => {
-    setHiddenTasks((prev) => (prev.size === 0 ? new Set(tasks.map((task) => task.id)) : new Set()));
+    const hideAll = hiddenTasksRef.current.size === 0;
+    const next = hideAll ? new Set(tasks.map((task) => task.id)) : new Set<number>();
+    hiddenTasksRef.current = next;
+    setHiddenTasks(next);
+    if (hideAll) return; // 全部隐藏时图表切到空态,交给 React 卸载
+    // "显示全部":图表仍在(部分隐藏)则逐条恢复并缓动;从空态恢复时实例为空,
+    // 重新挂载的图表会用最新 ref 构建系列可见性,无需命令式调用。
+    const u = chartInstanceRef.current;
+    if (!u || !chart) return;
+    const fromMin = u.scales.y.min;
+    const fromMax = u.scales.y.max;
+    const target = computePingYRange(chart, tasks, hiddenTasksRef.current, chartMetric);
+    tasks.forEach((task) => {
+      const seriesIdx = taskIndexById.get(task.id);
+      if (seriesIdx != null) u.setSeries(seriesIdx + 1, { show: true });
+    });
+    animateYScale(u, fromMin, fromMax, target);
   };
 
   if (isLoading) {
@@ -638,6 +720,16 @@ export function PingChart({
               key={`${uuid}-${hours}-${chartMetric}-${cutPeak ? "smooth" : "raw"}-${connectNulls ? "span" : "gap"}`}
               options={options}
               data={chart}
+              onCreate={(u) => {
+                chartInstanceRef.current = u;
+              }}
+              onDelete={() => {
+                if (yScaleAnimRef.current != null) {
+                  cancelAnimationFrame(yScaleAnimRef.current);
+                  yScaleAnimRef.current = null;
+                }
+                chartInstanceRef.current = null;
+              }}
             />
             <ChartTooltip tooltip={tooltip} />
           </>

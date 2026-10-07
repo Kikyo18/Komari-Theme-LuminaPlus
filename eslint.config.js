@@ -15,6 +15,11 @@ export default tseslint.config(
     },
     plugins: { "react-hooks": reactHooks },
     rules: {
+      "@typescript-eslint/no-unused-vars": [
+        "error",
+        // 代码库惯例:_ 前缀表示"占位不使用"的参数/变量(如 uPlot 回调的 self)。
+        { argsIgnorePattern: "^_", varsIgnorePattern: "^_" },
+      ],
       "react-hooks/rules-of-hooks": "error",
       "react-hooks/exhaustive-deps": "warn",
     },

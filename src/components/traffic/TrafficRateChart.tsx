@@ -5,6 +5,7 @@ import "uplot/dist/uPlot.min.css";
 import { ChartTooltip } from "@/components/instance/ChartParts";
 import {
   buildChartTooltipHooks,
+  buildYScale,
   CHART_PALETTE,
   createTimeAxisFormatter,
   getAxisColors,
@@ -79,7 +80,8 @@ export function TrafficRateChart({ samples }: { samples: TodayTrafficSample[] })
       legend: { show: false },
       scales: {
         x: { time: true },
-        y: { auto: true },
+        // 速率是容量型信号,0 基准避免恒定低速时 auto 轴把微小抖动放大成满幅地震仪。
+        y: buildYScale({ anchorZero: true }),
       },
       axes: [
         {

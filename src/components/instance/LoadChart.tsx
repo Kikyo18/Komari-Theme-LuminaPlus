@@ -16,13 +16,16 @@ import { useNodeMeta, useNodeMetrics } from "@/hooks/useNode";
 import { InstancePanel, InstanceChartLoading } from "./InstancePanel";
 import {
   buildChartTooltipHooks,
+  buildYScale,
   CHART_PALETTE,
   createTimeAxisFormatter,
   formatChartCoverageTime,
   getAxisColors,
+  pickAxisDecimals,
   toChartSeconds,
   useResponsiveChartSize,
   type ChartTooltipState,
+  type YScaleOptions,
 } from "./chartShared";
 import { ChartTooltip, SwitchToggle } from "./ChartParts";
 import {
@@ -34,7 +37,17 @@ import { formatBytes, formatTrafficRateLabel } from "@/utils/format";
 import { historyChartRangeSeconds, historyCoverageLabel } from "@/utils/historyRange";
 import { resolveLoadRecordTotals } from "@/utils/loadMetrics";
 import { usePreferences } from "@/hooks/usePreferences";
-import type { LoadRecord, NodeMetrics } from "@/types/komari";
+import {
+  formatLoadSwapLabel,
+  formatLoadUsedLabel,
+  loadPointFromNode,
+  loadPointFromRecord,
+  type LoadChartPoint,
+  type LoadChartUnit,
+} from "./loadChartPoints";
+import type { LoadRecord } from "@/types/komari";
+
+type ChartPoint = LoadChartPoint;
 
 const LOAD_HISTORY_SAMPLE_LIMIT = 360;
 const LOAD_HISTORY_RENDER_LIMIT = 720;
@@ -75,11 +88,6 @@ const LOAD_INTERPOLATE_KEYS = [
   "udp",
   "process",
 ];
-
-interface ChartPoint {
-  time: number;
-  [key: string]: number | null;
-}
 
 function metricData(points: ChartPoint[], keys: string[]): uPlot.AlignedData {
   const times = points.map((point) => point.time);
@@ -130,35 +138,17 @@ function getSeriesLabel(key: string) {
   return SERIES_LABELS[key] ?? key;
 }
 
-function pointFromNode(node: NodeMetrics): ChartPoint {
-  return {
-    time: node.updatedAt > 0 ? node.updatedAt / 1000 : Date.now() / 1000,
-    cpu: node.cpuPct,
-    // total 为 0 表示该指标不存在(如无 Swap),填 null 让 uPlot 不画线,而不是画一条假的 0%。
-    ram: node.ramTotal > 0 ? (node.ramUsed / node.ramTotal) * 100 : null,
-    swap: node.swapTotal > 0 ? (node.swapUsed / node.swapTotal) * 100 : null,
-    disk: node.diskTotal > 0 ? (node.diskUsed / node.diskTotal) * 100 : null,
-    netIn: node.netDown,
-    netOut: node.netUp,
-    connections: node.connectionsTcp,
-    udp: node.connectionsUdp,
-    process: node.process,
-  };
-}
-
 function formatTooltipValue(key: string, value: number | null | undefined, unit: string) {
   if (value == null || !Number.isFinite(value)) return "—";
   if (key === "netIn" || key === "netOut") return formatTrafficRateLabel(value);
   if (unit === "%") return `${value.toFixed(2)}%`;
+  if (unit === "bytes") return formatBytes(value);
   if (key === "process" || key === "connections" || key === "udp") return `${Math.round(value)}`;
   return value.toFixed(2);
 }
 
 function formatPercentAxisValue(value: number, min: number, max: number) {
-  const span = Math.abs(max - min);
-  if (span < 0.5) return `${value.toFixed(2)}%`;
-  if (span < 5) return `${value.toFixed(1)}%`;
-  return `${Math.round(value)}%`;
+  return `${value.toFixed(pickAxisDecimals(max - min))}%`;
 }
 
 function formatNetworkAxisValue(value: number) {
@@ -166,10 +156,13 @@ function formatNetworkAxisValue(value: number) {
   return formatTrafficRateLabel(value);
 }
 
+function formatBytesAxisValue(value: number) {
+  if (!Number.isFinite(value) || value <= 0) return "";
+  return formatBytes(value);
+}
+
 function formatCountAxisValue(value: number, min: number, max: number) {
-  const span = Math.abs(max - min);
-  if (span < 10) return value.toFixed(1);
-  return `${Math.round(value)}`;
+  return value.toFixed(pickAxisDecimals(max - min));
 }
 
 // 不含尺寸的配置。width/height 由调用方在另一个 memo 里加上，resize 时只改这两个 key，
@@ -185,6 +178,7 @@ function buildBaseOptions({
   axisKind,
   axisSize = 52,
   xRange,
+  yScale,
 }: {
   title: string;
   keys: string[];
@@ -192,9 +186,10 @@ function buildBaseOptions({
   resolvedAppearance: "light" | "dark";
   rangeHours: number;
   spanGaps?: boolean;
-  axisKind: "percent" | "network" | "count";
+  axisKind: "percent" | "bytes" | "network" | "count";
   axisSize?: number;
   xRange?: [number, number] | null;
+  yScale: YScaleOptions;
 }): Omit<uPlot.Options, "width" | "height"> {
   const isDark = resolvedAppearance === "dark";
   const { grid, text } = getAxisColors(isDark);
@@ -205,7 +200,7 @@ function buildBaseOptions({
     legend: { show: false },
     scales: {
       x: xRange ? { time: true, auto: false, range: () => xRange } : { time: true },
-      y: { auto: true },
+      y: yScale,
     },
     axes: [
       {
@@ -226,6 +221,7 @@ function buildBaseOptions({
           return splits.map((value) => {
             if (value === 0 && axisKind !== "percent") return "";
             if (axisKind === "network") return formatNetworkAxisValue(value);
+            if (axisKind === "bytes") return formatBytesAxisValue(value);
             if (axisKind === "percent") return formatPercentAxisValue(value, min, max);
             return formatCountAxisValue(value, min, max);
           });
@@ -270,6 +266,10 @@ const ChartCard = memo(function ChartCard({
   axisKind,
   axisSize,
   xRange,
+  yFixedMin,
+  yFixedMax,
+  yAnchorZero,
+  yMinSpan,
 }: {
   icon: ReactNode;
   title: string;
@@ -283,9 +283,14 @@ const ChartCard = memo(function ChartCard({
   rangeHours: number;
   unit?: string;
   spanGaps?: boolean;
-  axisKind: "percent" | "network" | "count";
+  axisKind: "percent" | "bytes" | "network" | "count";
   axisSize?: number;
   xRange?: [number, number] | null;
+  /** Y 轴量程配置;都不传时退化为带边距的 auto 行为。 */
+  yFixedMin?: number;
+  yFixedMax?: number;
+  yAnchorZero?: boolean;
+  yMinSpan?: number;
 }) {
   const { w, h, ref: chartSizeRef } = useResponsiveChartSize("grid");
   const dataRef = useRef<uPlot.AlignedData>([[]]);
@@ -300,6 +305,16 @@ const ChartCard = memo(function ChartCard({
   useLayoutEffect(() => {
     dataRef.current = data;
   }, [data]);
+  const yScale = useMemo<YScaleOptions>(
+    () =>
+      buildYScale(
+        yFixedMin != null && yFixedMax != null
+          ? { fixed: [yFixedMin, yFixedMax] }
+          : { anchorZero: yAnchorZero, minSpan: yMinSpan },
+      ),
+    [yFixedMin, yFixedMax, yAnchorZero, yMinSpan],
+  );
+
   const baseOptions = useMemo(
     () =>
       buildBaseOptions({
@@ -312,8 +327,20 @@ const ChartCard = memo(function ChartCard({
         axisKind,
         axisSize,
         xRange,
+        yScale,
       }),
-    [axisKind, axisSize, colors, keys, rangeHours, resolvedAppearance, spanGaps, title, xRange],
+    [
+      axisKind,
+      axisSize,
+      colors,
+      keys,
+      rangeHours,
+      resolvedAppearance,
+      spanGaps,
+      title,
+      xRange,
+      yScale,
+    ],
   );
 
   const enhancedOptions = useMemo<Omit<uPlot.Options, "width" | "height">>(() => {
@@ -398,6 +425,9 @@ export function LoadChart({
   const { resolvedAppearance } = usePreferences();
   const [realtimePoints, setRealtimePoints] = useState<ChartPoint[]>([]);
   const [connectNulls, setConnectNulls] = useState(false);
+  // 默认按实际用量(字节)画内存/磁盘曲线;打开后换算成百分比。
+  const [showPercent, setShowPercent] = useState(false);
+  const loadUnit: LoadChartUnit = showPercent ? "percent" : "bytes";
   const totalFallbacks = useMemo(
     () => ({
       ramTotal: meta?.mem_total,
@@ -409,17 +439,17 @@ export function LoadChart({
 
   useEffect(() => {
     if (!active || !isRealtime || !node) return;
-    const point = pointFromNode(node);
+    const point = loadPointFromNode(node, loadUnit);
     setRealtimePoints((prev) => {
       const last = prev[prev.length - 1];
       if (last && Math.abs(last.time - point.time) < 1) return prev;
       return [...prev, point].slice(-REALTIME_SAMPLE_LIMIT);
     });
-  }, [active, isRealtime, node]);
+  }, [active, isRealtime, node, loadUnit]);
 
   useEffect(() => {
     setRealtimePoints([]);
-  }, [hours, uuid]);
+  }, [hours, uuid, loadUnit]);
 
   const historyRecords = useMemo<Array<{ record: LoadRecord; time: number }>>(
     () =>
@@ -431,25 +461,13 @@ export function LoadChart({
   );
 
   const historyPoints = useMemo<ChartPoint[]>(() => {
-    const rawPoints = historyRecords.map(({ record, time }) => {
-      const totals = resolveLoadRecordTotals(record, totalFallbacks);
-      return {
-        time,
-        cpu: record.cpu,
-        ram: totals.ramTotal > 0 ? (record.ram / totals.ramTotal) * 100 : null,
-        swap: totals.swapTotal > 0 ? (record.swap / totals.swapTotal) * 100 : null,
-        disk: totals.diskTotal > 0 ? (record.disk / totals.diskTotal) * 100 : null,
-        netIn: record.net_in,
-        netOut: record.net_out,
-        connections: record.connections,
-        udp: record.connections_udp,
-        process: record.process,
-      };
-    });
+    const rawPoints = historyRecords.map(({ record, time }) =>
+      loadPointFromRecord(record, time, totalFallbacks, loadUnit),
+    );
     const sampled = downsamplePoints(rawPoints, getHistoryRenderLimit(hours));
     const filled = fillMissingMetricPoints(sampled);
     return interpolateMetricGaps(filled, LOAD_INTERPOLATE_KEYS) as ChartPoint[];
-  }, [historyRecords, hours, totalFallbacks]);
+  }, [historyRecords, hours, totalFallbacks, loadUnit]);
 
   const points = useMemo<ChartPoint[]>(() => {
     if (isRealtime) {
@@ -491,6 +509,18 @@ export function LoadChart({
         : historyCoverageLabel(data, points[0]?.time, points[points.length - 1]?.time),
     [data, isRealtime, points],
   );
+  // 磁盘字节模式用容量做固定量程(0 基准);拿不到总量时退回 0 基准 auto。
+  const diskTotalForAxis = latestHistoryTotals?.diskTotal || totalFallbacks.diskTotal || 0;
+  // 内存/磁盘是容量指标:百分比模式固定 0-100,避免 auto 轴把零点几个百分点的波动
+  // 放大成整幅图(刻度文字也会随之重合);字节模式用 0 基准,磁盘再以容量封顶。
+  const memoryYProps = showPercent
+    ? { yFixedMin: 0, yFixedMax: 100 }
+    : { yAnchorZero: true };
+  const diskYProps = showPercent
+    ? { yFixedMin: 0, yFixedMax: 100 }
+    : diskTotalForAxis > 0
+      ? { yFixedMin: 0, yFixedMax: diskTotalForAxis }
+      : { yAnchorZero: true };
 
   if (isLoading) {
     return <InstanceChartLoading title="负载图表" />;
@@ -541,6 +571,12 @@ export function LoadChart({
             active={connectNulls}
             onToggle={() => setConnectNulls((value) => !value)}
           />
+          <SwitchToggle
+            label="内存/磁盘百分比"
+            title="开启后内存与磁盘曲线按百分比显示,关闭时按实际用量(字节)显示"
+            active={showPercent}
+            onToggle={() => setShowPercent((value) => !value)}
+          />
           <button
             type="button"
             className="instance-toggle-button"
@@ -576,25 +612,26 @@ export function LoadChart({
           spanGaps={connectNulls}
           axisKind="percent"
           xRange={requestedXRange}
+          yAnchorZero
+          yMinSpan={5}
         />
         <ChartCard
+          key={`memory-${uuid}-${hours}-${showPercent ? "percent" : "bytes"}`}
           icon={<MemoryStick size={13} />}
           title="内存"
           uuid={uuid}
           value={
             isRealtime && node
-              ? `${formatBytes(node.ramUsed)} / ${formatBytes(node.ramTotal)}`
+              ? formatLoadUsedLabel(loadUnit, node.ramUsed, node.ramTotal)
               : latestHistoryRecord && latestHistoryTotals
-                ? `${formatBytes(latestHistoryRecord.ram)} / ${formatBytes(latestHistoryTotals.ramTotal)}`
+                ? formatLoadUsedLabel(loadUnit, latestHistoryRecord.ram, latestHistoryTotals.ramTotal)
                 : "—"
           }
           note={
             isRealtime && node
-              ? node.swapTotal
-                ? `Swap ${formatBytes(node.swapUsed)} / ${formatBytes(node.swapTotal)}`
-                : "Swap 无"
-              : latestHistoryRecord && latestHistoryTotals && latestHistoryTotals.swapTotal > 0
-                ? `Swap ${formatBytes(latestHistoryRecord.swap)} / ${formatBytes(latestHistoryTotals.swapTotal)}`
+              ? formatLoadSwapLabel(loadUnit, node.swapUsed, node.swapTotal)
+              : latestHistoryRecord && latestHistoryTotals
+                ? formatLoadSwapLabel(loadUnit, latestHistoryRecord.swap, latestHistoryTotals.swapTotal)
                 : "Swap 无"
           }
           points={points}
@@ -602,20 +639,23 @@ export function LoadChart({
           colors={MEMORY_COLORS}
           resolvedAppearance={resolvedAppearance}
           rangeHours={hours}
-          unit="%"
+          unit={showPercent ? "%" : "bytes"}
           spanGaps={connectNulls}
-          axisKind="percent"
+          axisKind={showPercent ? "percent" : "bytes"}
+          axisSize={showPercent ? undefined : 78}
           xRange={requestedXRange}
+          {...memoryYProps}
         />
         <ChartCard
+          key={`disk-${uuid}-${hours}-${showPercent ? "percent" : "bytes"}`}
           icon={<HardDrive size={13} />}
           title="磁盘"
           uuid={uuid}
           value={
             isRealtime && node
-              ? `${formatBytes(node.diskUsed)} / ${formatBytes(node.diskTotal)}`
+              ? formatLoadUsedLabel(loadUnit, node.diskUsed, node.diskTotal)
               : latestHistoryRecord && latestHistoryTotals
-                ? `${formatBytes(latestHistoryRecord.disk)} / ${formatBytes(latestHistoryTotals.diskTotal)}`
+                ? formatLoadUsedLabel(loadUnit, latestHistoryRecord.disk, latestHistoryTotals.diskTotal)
                 : "—"
           }
           note="已用空间"
@@ -624,10 +664,12 @@ export function LoadChart({
           colors={DISK_COLORS}
           resolvedAppearance={resolvedAppearance}
           rangeHours={hours}
-          unit="%"
+          unit={showPercent ? "%" : "bytes"}
           spanGaps={connectNulls}
-          axisKind="percent"
+          axisKind={showPercent ? "percent" : "bytes"}
+          axisSize={showPercent ? undefined : 78}
           xRange={requestedXRange}
+          {...diskYProps}
         />
         <ChartCard
           icon={<Network size={13} />}
@@ -655,6 +697,7 @@ export function LoadChart({
           axisKind="network"
           axisSize={78}
           xRange={requestedXRange}
+          yAnchorZero
         />
         <ChartCard
           icon={<Workflow size={13} />}
@@ -676,6 +719,7 @@ export function LoadChart({
           spanGaps={connectNulls}
           axisKind="count"
           xRange={requestedXRange}
+          yAnchorZero
         />
         <ChartCard
           icon={<Gauge size={13} />}
@@ -703,6 +747,7 @@ export function LoadChart({
           spanGaps={connectNulls}
           axisKind="count"
           xRange={requestedXRange}
+          yAnchorZero
         />
       </div>
     </InstancePanel>
