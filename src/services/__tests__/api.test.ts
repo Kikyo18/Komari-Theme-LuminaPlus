@@ -18,6 +18,7 @@ vi.mock("@/services/rpc2Client", () => ({
 }));
 
 import {
+  getLoadRealtimeSeed,
   getLoadRecords,
   getPingOverview,
   getPingOverviewStats,
@@ -350,5 +351,113 @@ describe("metric boundary repair in the API adapter", () => {
       }),
       expect.anything(),
     );
+  });
+});
+
+function seedRpcPayload(params: Record<string, unknown>) {
+  const start = Date.parse(String(params.start ?? ""));
+  const end = Date.parse(String(params.end ?? ""));
+  const windowMs = end - start;
+  const isRaw = windowMs <= 10.5 * 60_000;
+  const pointTime = new Date(end - (isRaw ? 5 : 15) * 60_000).toISOString();
+  return {
+    start: params.start,
+    end: params.end,
+    series: [
+      {
+        metric_key: "cpu.usage",
+        entity_id: "node-a",
+        tags: TAGS,
+        interval_seconds: isRaw ? 5 : 60,
+        points: [{ time: pointTime, value: isRaw ? 55 : 45, count: 1 }],
+      },
+    ],
+  };
+}
+
+function installSeedRpcResponses({ bucketFails = false, rawFails = false } = {}) {
+  rpcCallMock.mockImplementation((method: string, params: Record<string, unknown>) => {
+    if (method === "public:queryMetrics") {
+      // 能力探测调用(无 metric_keys)返回成功表示方法存在;hours 形式的降级查询
+      // (无 start/end)返回失败,推动回退到 common:getRecords。
+      if (!Array.isArray(params?.metric_keys)) return Promise.resolve({});
+      const hasWindow = Number.isFinite(Date.parse(String(params?.start ?? "")));
+      if (!hasWindow) return Promise.reject(new Error("aggregate query failed"));
+      const windowMs = Date.parse(String(params.end)) - Date.parse(String(params.start));
+      const isRaw = windowMs <= 10.5 * 60_000;
+      if (isRaw && rawFails) return Promise.reject(new Error("raw window failed"));
+      if (!isRaw && bucketFails) return Promise.reject(new Error("bucket window failed"));
+      return Promise.resolve(seedRpcPayload(params));
+    }
+    if (method === "common:getRecords") {
+      const loadRecord = (cpu: number, minutesAgo: number) => ({
+        client: "node-a",
+        time: new Date(Date.now() - minutesAgo * 60_000).toISOString(),
+        cpu,
+        gpu: 0,
+        ram: 0,
+        ram_total: 0,
+        swap: 0,
+        swap_total: 0,
+        load: 0,
+        temp: 0,
+        disk: 0,
+        disk_total: 0,
+        net_in: 0,
+        net_out: 0,
+        net_total_up: 0,
+        net_total_down: 0,
+        process: 0,
+        connections: 0,
+        connections_udp: 0,
+      });
+      return Promise.resolve({
+        count: 2,
+        records: [loadRecord(10, 20), loadRecord(20, 5)],
+      });
+    }
+    return Promise.reject(new Error(`Unexpected RPC method: ${method}`));
+  });
+}
+
+describe("getLoadRealtimeSeed", () => {
+  beforeEach(() => {
+    rpcCallMock.mockReset();
+  });
+
+  it("merges the 20-minute bucket window and the 10-minute raw window", async () => {
+    installSeedRpcResponses();
+    const result = await getLoadRealtimeSeed("node-a");
+
+    expect(result.records).toHaveLength(2);
+    expect(result.records[0].cpu).toBe(45);
+    expect(result.records[1].cpu).toBe(55);
+    expect(result.rangeStartMs).toBeDefined();
+    expect(result.rawStartMs).toBeGreaterThan(result.rangeStartMs ?? 0);
+  });
+
+  it("returns only the raw window when the bucket query fails", async () => {
+    installSeedRpcResponses({ bucketFails: true });
+    const result = await getLoadRealtimeSeed("node-a");
+
+    expect(result.records).toHaveLength(1);
+    expect(result.records[0].cpu).toBe(55);
+  });
+
+  it("returns only the bucket window when the raw query fails", async () => {
+    installSeedRpcResponses({ rawFails: true });
+    const result = await getLoadRealtimeSeed("node-a");
+
+    expect(result.records).toHaveLength(1);
+    expect(result.records[0].cpu).toBe(45);
+  });
+
+  it("falls back to the compatibility records chain when both windows fail", async () => {
+    installSeedRpcResponses({ bucketFails: true, rawFails: true });
+    const result = await getLoadRealtimeSeed("node-a");
+
+    // common:getRecords 路径返回的记录
+    expect(result.records.length).toBeGreaterThan(0);
+    expect(result.rawStartMs).toBeUndefined();
   });
 });

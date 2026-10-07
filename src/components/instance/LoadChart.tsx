@@ -11,7 +11,7 @@ import {
 import UplotReact from "uplot-react";
 import type uPlot from "uplot";
 import { ArrowDown, ArrowUp, Cpu, Gauge, HardDrive, MemoryStick, Network, RefreshCw, Workflow } from "lucide-react";
-import { useLoadRecords } from "@/hooks/useRecords";
+import { useLoadRealtimeSeed, useLoadRecords } from "@/hooks/useRecords";
 import { useNodeMeta, useNodeMetrics } from "@/hooks/useNode";
 import { InstancePanel, InstanceChartLoading } from "./InstancePanel";
 import {
@@ -38,10 +38,12 @@ import { historyChartRangeSeconds, historyCoverageLabel } from "@/utils/historyR
 import { resolveLoadRecordTotals } from "@/utils/loadMetrics";
 import { usePreferences } from "@/hooks/usePreferences";
 import {
+  buildLoadSeedPoints,
   formatLoadSwapLabel,
   formatLoadUsedLabel,
   loadPointFromNode,
   loadPointFromRecord,
+  LOAD_SERIES_KEYS,
   type LoadChartPoint,
   type LoadChartUnit,
 } from "./loadChartPoints";
@@ -51,8 +53,9 @@ type ChartPoint = LoadChartPoint;
 
 const LOAD_HISTORY_SAMPLE_LIMIT = 360;
 const LOAD_HISTORY_RENDER_LIMIT = 720;
-const REALTIME_HISTORY_SEED_LIMIT = 120;
 const REALTIME_SAMPLE_LIMIT = 600;
+// 实时种子(20 分钟桶 + 10 分钟原始样本)的渲染上限,超过则保峰降采样。
+const REALTIME_SEED_MAX_POINTS = 360;
 
 const CPU_KEYS = ["cpu"];
 const CPU_COLORS = [CHART_PALETTE.cpu];
@@ -77,17 +80,7 @@ const SERIES_LABELS: Record<string, string> = {
   udp: "UDP",
   process: "进程",
 };
-const LOAD_INTERPOLATE_KEYS = [
-  "cpu",
-  "ram",
-  "swap",
-  "disk",
-  "netIn",
-  "netOut",
-  "connections",
-  "udp",
-  "process",
-];
+const LOAD_INTERPOLATE_KEYS = LOAD_SERIES_KEYS;
 
 function metricData(points: ChartPoint[], keys: string[]): uPlot.AlignedData {
   const times = points.map((point) => point.time);
@@ -99,17 +92,7 @@ function getHistoryRenderLimit(hours: number) {
   return LOAD_HISTORY_RENDER_LIMIT;
 }
 
-const DOWNSAMPLE_KEYS = [
-  "cpu",
-  "ram",
-  "swap",
-  "disk",
-  "netIn",
-  "netOut",
-  "connections",
-  "udp",
-  "process",
-] as const;
+const DOWNSAMPLE_KEYS = LOAD_SERIES_KEYS;
 
 // 走与 Ping 图同一套时间分桶保峰降采样:抽点式降采样会随机丢掉桶内尖峰,
 // 而负载/网速的瞬时突刺正是最需要保留的信息。
@@ -413,13 +396,15 @@ export function LoadChart({
   hours: number;
   active?: boolean;
 }) {
-  const queryHours = hours === 0 ? 1 : hours;
-  const { data, isError, isFetching, isLoading, refetch } = useLoadRecords(
-    uuid,
-    queryHours,
-    active,
-  );
   const isRealtime = hours === 0;
+  // 实时档的种子来自专用查询(20 分钟桶 + 10 分钟原始样本);历史档保持按小时拉取。
+  const loadHistory = useLoadRecords(uuid, hours, active && !isRealtime);
+  const realtimeSeed = useLoadRealtimeSeed(uuid, active && isRealtime);
+  const data = isRealtime ? realtimeSeed.data : loadHistory.data;
+  const isError = isRealtime ? realtimeSeed.isError : loadHistory.isError;
+  const isFetching = isRealtime ? realtimeSeed.isFetching : loadHistory.isFetching;
+  const isLoading = isRealtime ? realtimeSeed.isLoading : loadHistory.isLoading;
+  const refetch = isRealtime ? realtimeSeed.refetch : loadHistory.refetch;
   const node = useNodeMetrics(uuid, isRealtime && active);
   const meta = useNodeMeta(uuid);
   const { resolvedAppearance } = usePreferences();
@@ -461,18 +446,30 @@ export function LoadChart({
   );
 
   const historyPoints = useMemo<ChartPoint[]>(() => {
+    if (isRealtime) {
+      // 种子:20 分钟 1 分钟桶 + 10 分钟原始样本(rawStartMs 之后的记录不做补洞
+      // 插值 —— 原始段的样本缺失就是真实的停报,如实断开)。
+      const rawStartSec = data?.rawStartMs != null ? data.rawStartMs / 1000 : null;
+      return buildLoadSeedPoints(data?.records ?? [], {
+        rawStartSec,
+        fallbacks: totalFallbacks,
+        unit: loadUnit,
+        maxPoints: REALTIME_SEED_MAX_POINTS,
+      });
+    }
     const rawPoints = historyRecords.map(({ record, time }) =>
       loadPointFromRecord(record, time, totalFallbacks, loadUnit),
     );
     const sampled = downsamplePoints(rawPoints, getHistoryRenderLimit(hours));
     const filled = fillMissingMetricPoints(sampled);
-    return interpolateMetricGaps(filled, LOAD_INTERPOLATE_KEYS) as ChartPoint[];
-  }, [historyRecords, hours, totalFallbacks, loadUnit]);
+    return interpolateMetricGaps(filled, [...LOAD_INTERPOLATE_KEYS]) as ChartPoint[];
+  }, [data, isRealtime, historyRecords, hours, totalFallbacks, loadUnit]);
 
   const points = useMemo<ChartPoint[]>(() => {
     if (isRealtime) {
-      const initial = historyPoints.slice(-REALTIME_HISTORY_SEED_LIMIT);
-      const merged = [...initial, ...realtimePoints].sort((a, b) => a.time - b.time);
+      // 完整种子(桶段 + 原始段)与实时瞬时点合并;滚动窗口由 SAMPLE_LIMIT 兜底,
+      // 旧点随实时点累积自然滑出。
+      const merged = [...historyPoints, ...realtimePoints].sort((a, b) => a.time - b.time);
       const deduped = merged.filter((point, index, arr) => {
         const next = arr[index + 1];
         return !next || Math.abs(next.time - point.time) >= 1;

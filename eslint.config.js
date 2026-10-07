@@ -3,7 +3,8 @@ import reactHooks from "eslint-plugin-react-hooks";
 import tseslint from "typescript-eslint";
 
 export default tseslint.config(
-  { ignores: ["dist", "node_modules", "scripts", "public"] },
+  // tmp/ 放本地参考克隆(如 Komari 服务端源码),不参与本主题工程的 lint。
+  { ignores: ["dist", "node_modules", "scripts", "public", "tmp"] },
   ...tseslint.configs.recommended,
   {
     files: ["src/**/*.{ts,tsx}"],

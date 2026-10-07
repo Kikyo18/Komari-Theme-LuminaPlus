@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  buildLoadSeedPoints,
   formatLoadSwapLabel,
   formatLoadUsedLabel,
   loadPointFromNode,
@@ -148,5 +149,99 @@ describe("formatLoadSwapLabel", () => {
   it("formats swap in the active unit", () => {
     expect(formatLoadSwapLabel("bytes", GIB, 2 * GIB)).toBe("Swap 1.00 GB / 2.00 GB");
     expect(formatLoadSwapLabel("percent", GIB, 2 * GIB)).toBe("Swap 50.00%");
+  });
+});
+
+describe("buildLoadSeedPoints", () => {
+  const BASE_SEC = 1_800_000_000;
+  const at = (offsetSec: number) => new Date((BASE_SEC + offsetSec) * 1000).toISOString();
+  const seedRecord = (offsetSec: number, cpu: number): LoadRecord =>
+    loadRecord({ cpu, time: at(offsetSec), ram: 4 * GIB, ram_total: 0 });
+
+  const options = (overrides: Partial<Parameters<typeof buildLoadSeedPoints>[1]> = {}) => ({
+    rawStartSec: BASE_SEC + 180,
+    fallbacks: { ramTotal: 8 * GIB, swapTotal: 2 * GIB, diskTotal: 160 * GIB },
+    unit: "bytes" as const,
+    maxPoints: 360,
+    ...overrides,
+  });
+
+  it("合并桶段与原始段,按时间排序且不越段插值", () => {
+    const records = [
+      seedRecord(0, 10),
+      seedRecord(60, 20),
+      seedRecord(120, 30),
+      seedRecord(185, 40),
+      seedRecord(190, 50),
+      seedRecord(195, 60),
+    ];
+    const points = buildLoadSeedPoints(records, options());
+
+    expect(points.map((point) => point.time)).toEqual([
+      BASE_SEC,
+      BASE_SEC + 60,
+      BASE_SEC + 120,
+      BASE_SEC + 185,
+      BASE_SEC + 190,
+      BASE_SEC + 195,
+    ]);
+    expect(points.map((point) => point.cpu)).toEqual([10, 20, 30, 40, 50, 60]);
+  });
+
+  it("桶段缺失的分钟会被补洞插值桥接,原始段的缺口保持原样", () => {
+    const records = [
+      seedRecord(0, 10),
+      seedRecord(60, 20),
+      seedRecord(120, 30),
+      seedRecord(240, 50), // 缺 +180 的桶
+      seedRecord(305, 60),
+      seedRecord(315, 70), // 原始段缺 +310 的样本
+    ];
+    const points = buildLoadSeedPoints(records, options({ rawStartSec: BASE_SEC + 300 }));
+
+    // 桶段补洞:+180 处被插入并桥接(值在 30 与 50 之间)
+    const bridged = points.find((point) => point.time === BASE_SEC + 180);
+    expect(bridged).toBeDefined();
+    expect(bridged?.cpu).toBeGreaterThan(30);
+    expect(bridged?.cpu).toBeLessThan(50);
+    // 原始段不补洞:+310 处没有点
+    expect(points.some((point) => point.time === BASE_SEC + 310)).toBe(false);
+  });
+
+  it("桶段为空时直接使用原始段", () => {
+    const points = buildLoadSeedPoints(
+      [seedRecord(185, 40), seedRecord(190, 50)],
+      options(),
+    );
+
+    expect(points.map((point) => point.time)).toEqual([BASE_SEC + 185, BASE_SEC + 190]);
+  });
+
+  it("原始段为空时只输出桶段", () => {
+    const points = buildLoadSeedPoints(
+      [seedRecord(0, 10), seedRecord(60, 20)],
+      options(),
+    );
+
+    expect(points.map((point) => point.time)).toEqual([BASE_SEC, BASE_SEC + 60]);
+  });
+
+  it("rawStartSec 为空时全部按桶段处理(旧后端兼容路径)", () => {
+    const points = buildLoadSeedPoints(
+      [seedRecord(0, 10), seedRecord(60, 20), seedRecord(120, 30)],
+      options({ rawStartSec: null }),
+    );
+
+    expect(points).toHaveLength(3);
+  });
+
+  it("记录为空时返回空数组", () => {
+    expect(buildLoadSeedPoints([], options())).toEqual([]);
+  });
+
+  it("超过渲染上限时降采样", () => {
+    const records = Array.from({ length: 40 }, (_, index) => seedRecord(index * 5, index));
+
+    expect(buildLoadSeedPoints(records, options({ maxPoints: 8 })).length).toBeLessThanOrEqual(8);
   });
 });

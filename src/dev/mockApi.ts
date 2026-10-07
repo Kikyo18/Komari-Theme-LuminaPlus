@@ -378,6 +378,8 @@ function pingMetricPayload(params: {
 }
 
 // queryMetrics 的负载路径:直接把 loadRecords 的字段转成对应 metric 序列。
+// 模拟服务端的 useRaw 通道:窗口 ≤10 分钟且结尾落在最近 10 分钟内时,按 5 秒
+// 粒度取最近的合成记录值(模拟 agent 高频上报);否则返回 5 分钟聚合桶。
 const LOAD_METRIC_RECORD_FIELD = {
   "cpu.usage": "cpu",
   "memory.used": "ram",
@@ -393,28 +395,68 @@ const LOAD_METRIC_RECORD_FIELD = {
   "connections.udp": "connections_udp",
 } as const;
 
-function loadMetricPayload(params: { metric_keys?: string[]; entity_ids?: string[] }) {
+function nearestRecordIndex(recordTimes: number[], t: number): number {
+  let nearest = 0;
+  let best = Number.POSITIVE_INFINITY;
+  for (let index = 0; index < recordTimes.length; index += 1) {
+    const distance = Math.abs(recordTimes[index] - t);
+    if (distance < best) {
+      best = distance;
+      nearest = index;
+    }
+  }
+  return nearest;
+}
+
+function loadMetricPayload(params: {
+  metric_keys?: string[];
+  entity_ids?: string[];
+  start?: string;
+  end?: string;
+}) {
+  const now = Date.now();
+  const startMs = Number.isFinite(Date.parse(params.start ?? ""))
+    ? Date.parse(params.start ?? "")
+    : now - 72 * 300_000;
+  const endMs = Number.isFinite(Date.parse(params.end ?? ""))
+    ? Date.parse(params.end ?? "")
+    : now;
+  const useRaw = endMs - startMs <= 10 * 60_000 && endMs > now - 10 * 60_000;
   const entityIds = params.entity_ids?.length ? params.entity_ids : [nodes[0].uuid];
   const metricKeys = (params.metric_keys ?? []).filter(
     (key): key is keyof typeof LOAD_METRIC_RECORD_FIELD => key in LOAD_METRIC_RECORD_FIELD,
   );
   const series = entityIds.flatMap((uuid) => {
     const records = loadRecords(uuid);
+    const recordTimes = records.map((record) =>
+      typeof record.time === "number" ? record.time : Date.parse(record.time),
+    );
+    const sampleTimes: number[] = [];
+    if (useRaw) {
+      const from = Math.max(startMs, recordTimes[0] ?? startMs);
+      const to = Math.min(endMs, recordTimes[recordTimes.length - 1] ?? endMs);
+      for (let t = from; t <= to; t += 5_000) sampleTimes.push(t);
+      if (sampleTimes[sampleTimes.length - 1] !== to) sampleTimes.push(to);
+    } else {
+      for (const t of recordTimes) {
+        if (t >= startMs && t <= endMs) sampleTimes.push(t);
+      }
+    }
+    const intervalSeconds = useRaw ? 5 : 300;
     return metricKeys.map((metricKey) => ({
       metric_key: metricKey,
       entity_id: uuid,
-      interval_seconds: 300,
-      points: records.map((record) => ({
-        time: new Date(record.time).toISOString(),
-        value: record[LOAD_METRIC_RECORD_FIELD[metricKey]],
+      interval_seconds: intervalSeconds,
+      points: sampleTimes.map((t) => ({
+        time: new Date(t).toISOString(),
+        value: records[nearestRecordIndex(recordTimes, t)][LOAD_METRIC_RECORD_FIELD[metricKey]],
         count: 1,
       })),
     }));
   });
-  const now = Date.now();
   return {
-    start: new Date(now - 72 * 300_000).toISOString(),
-    end: new Date(now).toISOString(),
+    start: new Date(startMs).toISOString(),
+    end: new Date(endMs).toISOString(),
     series,
     count: series.length,
   };

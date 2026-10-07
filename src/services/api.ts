@@ -12,6 +12,7 @@ import {
   type NodeInfo,
   type PublicConfig,
   type AdminClient,
+  type LoadRecord,
   type LoadRecordsResponse,
   type PingRecordsResponse,
   type PingTask,
@@ -950,6 +951,92 @@ export async function getLoadRecords(
       intervalSeconds: inferHistoryIntervalSeconds(legacy.records),
     };
   }
+}
+
+// 实时种子窗口:20 分钟 1 分钟桶 + 10 分钟原始样本,合计约 30 分钟视野。
+// 10 分钟是服务端 metric store 的 RawRetention(固定值,无配置键):
+// queryMetrics 的窗口 ≤10 分钟且结尾落在其中时,返回 agent 原始上报频率的
+// 精确样本(useRaw 通道);窗口更长则整段降级为 rollup 聚合桶。
+export const LOAD_REALTIME_BUCKET_WINDOW_MS = 20 * 60_000;
+export const LOAD_REALTIME_RAW_WINDOW_MS = 10 * 60_000;
+
+async function getLoadMetricRange(
+  uuid: string,
+  startMs: number,
+  endMs: number,
+  signal?: AbortSignal,
+  timeout?: number,
+): Promise<LoadRecordsResponse> {
+  const metricPayload = await queryMetricPayload(
+    {
+      start: new Date(startMs).toISOString(),
+      end: new Date(endMs).toISOString(),
+      entity_ids: [uuid],
+      metric_keys: LOAD_METRIC_KEYS,
+      max_points: DETAIL_METRIC_MAX_POINTS,
+      aggregation: "avg",
+      aggregation_by_metric: LOAD_LAST_AGGREGATION,
+      fill_empty: false,
+    },
+    signal,
+    timeout,
+  );
+  const series: LoadMetricSeries[] = metricPayload.series.map((item) => ({
+    metricKey: item.metric_key,
+    client: item.entity_id,
+    intervalSeconds: item.interval_seconds,
+    points: item.points,
+  }));
+  const records = mergeLoadMetricSeries(series);
+  return {
+    count: records.length,
+    records,
+    ...getMetricPayloadRange(metricPayload, { rangeStartMs: startMs, rangeEndMs: endMs }),
+  };
+}
+
+function loadRecordTimeMs(record: LoadRecord): number {
+  return typeof record.time === "number" ? record.time : Date.parse(record.time);
+}
+
+/**
+ * 实时模式的种子数据:20 分钟 1 分钟桶 + 最近 10 分钟原始样本,合计约 30 分钟视野,
+ * 之后的曲线由 WebSocket 轮询的瞬时点接续。
+ *
+ * 边界情况:
+ * - 任一窗口查询失败时使用另一窗口的结果;两者都失败(旧后端无 metric API)则
+ *   回退到 getLoadRecords 的兼容链(1 小时 records,rawStartMs 缺省,图表层视为桶段)。
+ * - 刚接入的探针数据很少时,返回实际存在的记录(可能为空),图表层呈现空态。
+ */
+export async function getLoadRealtimeSeed(
+  uuid: string,
+  options?: ApiCallOptions,
+): Promise<LoadRecordsResponse> {
+  const endMs = Date.now();
+  const rawStartMs = endMs - LOAD_REALTIME_RAW_WINDOW_MS;
+  const bucketStartMs = rawStartMs - LOAD_REALTIME_BUCKET_WINDOW_MS;
+  const [bucketResult, rawResult] = await Promise.allSettled([
+    getLoadMetricRange(uuid, bucketStartMs, rawStartMs, options?.signal, options?.timeout),
+    getLoadMetricRange(uuid, rawStartMs, endMs, options?.signal, options?.timeout),
+  ]);
+  for (const result of [bucketResult, rawResult]) {
+    if (result.status === "rejected" && options?.signal?.aborted) throw result.reason;
+  }
+  const bucket = bucketResult.status === "fulfilled" ? bucketResult.value : null;
+  const raw = rawResult.status === "fulfilled" ? rawResult.value : null;
+  if (!bucket && !raw) {
+    return getLoadRecords(uuid, 1, options);
+  }
+  const records = [...(bucket?.records ?? []), ...(raw?.records ?? [])].sort(
+    (left, right) => loadRecordTimeMs(left) - loadRecordTimeMs(right),
+  );
+  return {
+    count: records.length,
+    records,
+    rangeStartMs: bucketStartMs,
+    rangeEndMs: endMs,
+    rawStartMs,
+  };
 }
 
 export interface TodayTrafficMetricResponse {

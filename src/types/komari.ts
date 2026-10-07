@@ -275,6 +275,8 @@ export interface LoadRecordsResponse {
   rangeStartMs?: number;
   rangeEndMs?: number;
   intervalSeconds?: number;
+  /** 实时种子专用:此时刻之后的记录为原始样本(未经 1 分钟桶聚合)。 */
+  rawStartMs?: number;
 }
 
 export interface PingRecordsResponse {
